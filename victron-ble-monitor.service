@@ -1,0 +1,17 @@
+[Unit]
+Description=Victron Blue Smart IP65 BLE Monitor
+After=bluetooth.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/victron-ble
+ExecStartPre=/bin/sleep 10
+ExecStart=/home/pi/victron-ble/.venv/bin/python3 victron_ble_monitor.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
