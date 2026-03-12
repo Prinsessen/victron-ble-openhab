@@ -277,3 +277,13 @@ The BLE charger data is the **primary sensor** for the INNOVV K7 auto-dump state
 | ON | Storage | `Charging — Storage` |
 
 See `innovv-k7/K7_AUTO_POWER_README.md` for full state machine documentation.
+
+## Credits
+
+**Author:** Nanna Agesen ([@Prinsessen](https://github.com/Prinsessen)) — Nanna@agesen.dk
+
+**BLE Protocol Reference:** [Olen](https://github.com/Olen) — Victron BLE GATT protocol reverse engineering via [VictronConnect / phoenix.py](https://github.com/Olen/solar-monitor). The init sequence, register map, and data packet format used in this daemon are based on Olen's work.
+
+## License
+
+This project is provided as-is for personal and educational use.
