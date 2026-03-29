@@ -7,12 +7,12 @@ Standalone BLE monitor daemon for the **Victron Blue Smart IP65 12/10** battery 
 | Component | Details |
 |-----------|---------|
 | Charger | Victron Blue Smart IP65 12/10 (12V, 10A) |
-| BLE Address | `EB:A8:21:DD:9C:A0` |
+| BLE Address | `AA:BB:CC:DD:EE:FF` |
 | BLE Name | "Springfield Charger" |
 | Manufacturer ID | `0x02E1` (Victron Energy) |
-| Host | Raspberry Pi 4 (`10.0.5.60`, user `pi`) |
+| Host | Raspberry Pi 4 (`192.168.1.60`, user `pi`) |
 | BLE Adapter | hci0 (`B8:27:EB:79:D9:95`) |
-| openHAB | `10.0.5.21:8080` |
+| openHAB | `192.168.1.100:8080` |
 
 ## How It Works
 
@@ -87,7 +87,7 @@ When the charger is disconnected from mains power, its BLE radio shuts off. Afte
 ### Pi Setup
 
 ```bash
-# On Pi 4 (10.0.5.60)
+# On Pi 4 (192.168.1.60)
 mkdir -p /home/pi/victron-ble
 python3 -m venv /home/pi/victron-ble/.venv
 source /home/pi/victron-ble/.venv/bin/activate
@@ -102,10 +102,10 @@ The charger must be paired and bonded before the daemon can connect:
 # On Pi — pair with default passkey 000000
 bluetoothctl
   scan on
-  # Wait for EB:A8:21:DD:9C:A0 to appear
-  pair EB:A8:21:DD:9C:A0
+  # Wait for AA:BB:CC:DD:EE:FF to appear
+  pair AA:BB:CC:DD:EE:FF
   # Enter passkey: 000000
-  trust EB:A8:21:DD:9C:A0
+  trust AA:BB:CC:DD:EE:FF
   quit
 ```
 
@@ -113,8 +113,8 @@ bluetoothctl
 
 ```bash
 # From openHAB host
-scp -i ~/.ssh/id_ed25519 victron_ble_monitor.py pi@10.0.5.60:/home/pi/victron-ble/
-scp -i ~/.ssh/id_ed25519 victron-ble-monitor.service pi@10.0.5.60:/tmp/
+scp -i ~/.ssh/id_ed25519 victron_ble_monitor.py pi@192.168.1.60:/home/pi/victron-ble/
+scp -i ~/.ssh/id_ed25519 victron-ble-monitor.service pi@192.168.1.60:/tmp/
 
 # On Pi
 sudo cp /tmp/victron-ble-monitor.service /etc/systemd/system/
@@ -163,8 +163,8 @@ All configuration is at the top of `victron_ble_monitor.py`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `CHARGER_ADDR` | `EB:A8:21:DD:9C:A0` | BLE MAC address of charger |
-| `OPENHAB_URL` | `http://10.0.5.21:8080/rest/items` | openHAB REST endpoint |
+| `CHARGER_ADDR` | `AA:BB:CC:DD:EE:FF` | BLE MAC address of charger |
+| `OPENHAB_URL` | `http://192.168.1.100:8080/rest/items` | openHAB REST endpoint |
 | `POLL_INTERVAL` | `30` | Seconds between BLE poll cycles |
 | `DATA_COLLECT_TIME` | `12` | Seconds to collect data per connection |
 | `OFFLINE_THRESHOLD` | `3` | Consecutive failures before marking offline |
@@ -215,7 +215,7 @@ victron-ble/
 ├── victron-ble-monitor.service     # Systemd service file
 └── requirements.txt                # Python dependencies
 
-# Deployed on Pi (10.0.5.60):
+# Deployed on Pi (192.168.1.60):
 /home/pi/victron-ble/
 ├── victron_ble_monitor.py          # Active daemon
 └── .venv/                          # Python virtual environment
@@ -229,7 +229,7 @@ sitemaps/myhouse.sitemap            # Victron Charger frame
 
 **BLE connection fails ("Device not found")**
 - Charger must be plugged into mains (BLE radio only active when powered)
-- Check pairing: `bluetoothctl info EB:A8:21:DD:9C:A0` → should show "Paired: yes, Bonded: yes"
+- Check pairing: `bluetoothctl info AA:BB:CC:DD:EE:FF` → should show "Paired: yes, Bonded: yes"
 - Re-pair if needed (see BLE Pairing section)
 
 **Voltage not received (V=0.00V)**
@@ -260,9 +260,10 @@ The BLE charger data is the **primary sensor** for the INNOVV K7 auto-dump state
 ### Key Integration Points
 
 - **`MC_Charger_BLE_Online`** — Triggers Rule 8 (BLE Charger Online). BLE ON + charging → start dump sequence. BLE OFF → re-arm from DUMP_DONE.
-- **`MC_Charger_State`** — Triggers Rule 9 (BLE Charge State). Idle/Off → re-arm to PARKED. Bulk/Absorption/Float → start dump sequence.
+- **`MC_Charger_State`** — Triggers Rule 9 (BLE Charge State). Off → re-arm to PARKED. Bulk/Absorption/Float/Storage/Idle → start dump sequence from PARKED (full battery may go straight to Storage).
 - **`MC_Charger_Connection`** — Computed by Rule 10 from BLE Online + State. Displayed in sitemap.
-- **Stabilisation authority** — During 60s stabilisation, BLE online + not charging = reject (false positive from voltage spike).
+- **Stabilisation authority** — During 60s stabilisation, BLE online + `isBLEConnected()` (charging OR Storage/Idle) = confirm. BLE online + not connected = reject (false positive from voltage spike).
+- **Three detection tiers** — `isBLECharging()` (active) → `isBLEConnected()` (Storage/Idle included) → voltage fallback. Used in post-ignition check, `startChargerSequence`, and stabilisation.
 - **Grace period** — After re-arm to PARKED, voltage-only charger detection suppressed for 5 minutes (battery voltage lingers > 13.0V). BLE always overrides.
 
 ### MC_Charger_Connection States

@@ -1,0 +1,80 @@
+// =============================================================================
+// Motorcycle K7 Auto-Power — Shelly Plus Uni + IRFP9140N MOSFET
+// =============================================================================
+// Shelly Plus Uni controls K7 dashcam power via IRFP9140N P-channel MOSFET.
+// Relay drives MOSFET gate; 10K pull-up ensures fail-safe OFF.
+// Flow: Charger detected -> Relay ON -> MOSFET ON -> K7 powers up ->
+//       Pi dumps footage -> Dump complete -> Relay OFF -> K7 shuts down.
+//
+// Physical wiring:
+//   - Shelly powered from always-on motorcycle battery circuit (fused 3A)
+//   - Shelly relay output -> IRFP9140N gate (via 100 ohm) + 10K pull-up
+//   - IRFP9140N Source: battery +12V, Drain: K7 DC+ input
+//   - Shelly ADC (Voltmeter:100) -> motorcycle battery (voltage sensing)
+//
+// ADC Calibration (2026-03-11):
+//   Fluke 175 reference: 13.13V, Shelly raw ADC: 12.86V → offset +0.27V
+//   Applied in JS poller (+0.27V added to raw Shelly API reading).
+//   Re-calibrate if Shelly firmware changes or wiring is modified.
+//
+// Device: shellyplusuni-aabbccddeeff  IP: 192.168.1.62  FW: 1.7.4
+// Thing:  shelly:shellyplusuni:aabbccddeeff
+// =============================================================================
+
+Group   gMC_K7_Power                            "K7 Auto-Power"                 <energy>        (gK7)   ["Equipment"]
+
+// --- Shelly Plus Uni Channels ---
+// Device: shellyplusuni-aabbccddeeff  IP: 192.168.1.62  MAC: AABBCCDDEEFF
+// MIGRATED 2026-03-26: Shelly binding broken (handleCommand never fires in 5.1.3)
+// All items now virtual — updated via direct HTTP poller in JS rules.
+// Relay control via HTTP to http://192.168.1.62/rpc/Switch.Set?id=0&on=true|false
+Switch  MC_K7_Relay         "K7 Power Relay [MAP(k7_onoff.map):%s]"     <k7-relay-blue> (gMC_K7_Power)  ["Switch"]      {autoupdate="false"}
+
+Number  MC_K7_Shelly_Voltage "Shelly Battery [%.2f V]"                   <k7-battery-green>       (gMC_K7_Power)  ["Measurement"]
+
+// --- Shelly Device Status (HTTP-polled) ---
+Number  MC_K7_Shelly_WiFi_Signal "Shelly WiFi [%d /4]"                  <network>       (gMC_K7_Power)  ["Measurement"]
+Number  MC_K7_Shelly_Uptime  "Shelly Uptime [%.0f s]"                   <time>          (gMC_K7_Power)  ["Measurement"]
+DateTime MC_K7_Shelly_LastUpdate "Shelly Last Update [%1$td.%1$tm %1$tH:%1$tM]" <time>  (gMC_K7_Power)  ["Status"]
+DateTime MC_K7_Shelly_Heartbeat  "Shelly Heartbeat [%1$td.%1$tm %1$tH:%1$tM]"  <time>  (gMC_K7_Power)  ["Status"]
+
+// --- Shelly API-polled Items (updated via JS rule) ---
+Number  MC_K7_Shelly_RSSI    "Shelly RSSI [%d dBm]"                    <network>       (gMC_K7_Power)  ["Measurement"]
+String  MC_K7_Shelly_SSID    "Shelly SSID [%s]"                        <network>       (gMC_K7_Power)  ["Status"]
+
+// --- Virtual State Items (no channel binding) ---
+String  MC_K7_Power_State   "K7 Power State [%s]"                       <status>        (gMC_K7_Power)  ["Status"]
+Switch  MC_Charger_Detected "Charger Detected [MAP(k7_onoff.map):%s]"   <k7-charger-green>        (gMC_K7_Power)  ["Status"]
+String  MC_K7_Power_Reason  "Power Reason [%s]"                         <text>          (gMC_K7_Power)  ["Status"]
+DateTime MC_K7_Relay_Since  "Relay ON Since [%1$tF %1$tR]"              <time>          (gMC_K7_Power)  ["Status"]
+
+// --- Victron Blue Smart IP65 12/10 Charger (BLE GATT via Pi4) ---
+// Pi4 daemon connects via BLE GATT 306b service, reads Victron registers,
+// and posts values to openHAB REST API every 30s.
+// BLE radio is active when charger has mains power. BLE Online ≠ charging:
+//   Online + Idle/Off = mains power but battery cable not connected
+//   Online + Bulk/Absorption/Float/Storage = actively charging
+// BLE address: AA:BB:CC:DD:EE:FF (paired+bonded with Pi4)
+Switch   MC_Charger_BLE_Online   "Charger BLE [MAP(k7_onoff.map):%s]"    <bluetooth>     (gMC_K7_Power)  ["Status"]
+Number   MC_Charger_BLE_RSSI     "BLE Signal [%d dBm]"                    <victron-rssi-blue-v1> (gMC_K7_Power) ["Measurement"]
+String   MC_Charger_BLE_Signal   "BLE Signal [%s]"                         <victron-rssi-blue-v1> (gMC_K7_Power) ["Status"]
+String   MC_Charger_Connection   "Charger [%s]"                           <network>       (gMC_K7_Power)  ["Status"]
+Number   MC_Charger_Voltage      "Charger Voltage [%.2f V]"              <energy>        (gMC_K7_Power)  ["Measurement"]
+Number   MC_Charger_Current      "Charger Current [%.2f A]"              <energy>        (gMC_K7_Power)  ["Measurement"]
+Number   MC_Charger_Current_mA   "Charger Current [%d mA]"              <energy>        (gMC_K7_Power)  ["Measurement"]
+Number   MC_Charger_Yield        "Charged Energy [%.3f kWh]"           <energy>        (gMC_K7_Power)  ["Measurement"]
+String   MC_Charger_State        "Charger State [%s]"                    <heating>       (gMC_K7_Power)  ["Status"]
+DateTime MC_Charger_Last_Update  "Charger Updated [%1$td.%1$tm %1$tH:%1$tM]" <time>     (gMC_K7_Power)  ["Status"]
+
+// --- Charge Session History (persisted to InfluxDB) ---
+// Updated by vehicle-motorcycle-k7-charge-history.js on each charge cycle.
+DateTime MC_Charge_Session_Start   "Session Start [%1$td.%1$tm %1$tH:%1$tM]"  <time>      (gMC_K7_Power)  ["Status"]
+DateTime MC_Charge_Session_End     "Session End [%1$td.%1$tm %1$tH:%1$tM]"    <time>      (gMC_K7_Power)  ["Status"]
+Number   MC_Charge_Session_Minutes "Session Duration [%.0f min]"              <time>      (gMC_K7_Power)  ["Measurement"]
+Number   MC_Charge_Session_V_Start "Start Voltage [%.2f V]"                   <energy>    (gMC_K7_Power)  ["Measurement"]
+Number   MC_Charge_Session_V_End   "End Voltage [%.2f V]"                     <energy>    (gMC_K7_Power)  ["Measurement"]
+Number   MC_Charge_Session_V_Delta "Voltage Change [%.2f V]"                  <energy>    (gMC_K7_Power)  ["Measurement"]
+Number   MC_Charge_Session_Wh      "Energy Charged [%.1f Wh]"                <energy>    (gMC_K7_Power)  ["Measurement"]
+String   MC_Charge_Session_Peak    "Peak Stage [%s]"                          <energy>    (gMC_K7_Power)  ["Status"]
+Number   MC_Charge_Session_Count   "Total Sessions [%.0f]"                    <none>      (gMC_K7_Power)  ["Measurement"]
+

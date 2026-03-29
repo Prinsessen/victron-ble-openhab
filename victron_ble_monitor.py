@@ -45,11 +45,11 @@ import time
 from typing import Optional
 
 import aiohttp
-from bleak import BleakClient, BleakError
+from bleak import BleakClient, BleakError, BleakScanner
 
 # ── Configuration ────────────────────────────────────────────────────────────
-CHARGER_ADDR = "EB:A8:21:DD:9C:A0"
-OPENHAB_URL = "http://10.0.5.21:8080/rest/items"
+CHARGER_ADDR = "AA:BB:CC:DD:EE:FF"
+OPENHAB_URL = "http://192.168.1.100:8080/rest/items"
 POLL_INTERVAL = 30          # seconds between connection cycles
 CONNECT_TIMEOUT = 10        # BLE connect timeout
 DATA_COLLECT_TIME = 12      # seconds to collect data after init (voltage arrives late)
@@ -71,6 +71,8 @@ ITEMS = {
     "yield_kwh":   "MC_Charger_Yield",
     "state":       "MC_Charger_State",
     "last_update": "MC_Charger_Last_Update",
+    "ble_rssi":    "MC_Charger_BLE_RSSI",
+    "ble_signal":  "MC_Charger_BLE_Signal",
 }
 
 # Victron register definitions: reg_id -> (name, dtype_expected, scale_fn)
@@ -181,8 +183,11 @@ class VictronBLEMonitor:
           Bulk:       below all setpoints, max current, voltage rising
           Recondition: >15.0V (desulfation pulse)
 
-        Current level does NOT determine phase — the charger can push
-        several amps at Float voltage if the battery demands it.
+        CRITICAL: Voltage setpoint matching takes priority over current level.
+        In Storage/Float modes with a full battery, the charger holds the
+        setpoint voltage with near-zero current (<50mA). This is NOT idle —
+        the charger is actively regulating. "Idle" only applies when voltage
+        doesn't match any setpoint AND current is low.
 
         Voltage stability (history) distinguishes Bulk (voltage rising through
         a setpoint zone) from actually being AT a setpoint.
@@ -190,9 +195,7 @@ class VictronBLEMonitor:
         if voltage is None:
             return "Unknown"
 
-        # No current flowing = Idle (battery disconnected or fully charged)
-        if current_ma is not None and current_ma < 50:
-            return "Idle"
+        low_current = current_ma is not None and current_ma < 50
 
         # Reconditioning / Equalization: voltage pushed very high
         if voltage >= self.V_RECONDITION:
@@ -201,29 +204,40 @@ class VictronBLEMonitor:
         # Check if voltage is stable (not rising through a zone during Bulk)
         is_stable = self._is_voltage_stable()
 
-        # Match voltage to nearest setpoint using tolerance bands
-        # Check from highest setpoint downward
+        # Match voltage to nearest setpoint using tolerance bands.
+        # Setpoint matching takes priority over current level — the charger
+        # actively maintains voltage at these setpoints even with near-zero
+        # current (e.g. Storage at 13.2V on a full battery draws <50mA).
+        # Check from highest setpoint downward.
         if abs(voltage - self.V_ABSORPTION) <= self.V_SETPOINT_TOL:
             # In absorption zone (14.1 - 14.7V)
             return "Absorption"
         elif abs(voltage - self.V_FLOAT) <= self.V_SETPOINT_TOL:
             # In float zone (13.5 - 14.1V)
-            if is_stable:
+            if low_current:
+                return "Float"  # Holding float setpoint with minimal current
+            elif is_stable:
                 return "Float"
             else:
                 # Voltage still rising through this zone → Bulk
                 return "Bulk"
         elif abs(voltage - self.V_STORAGE) <= self.V_SETPOINT_TOL:
             # In storage zone (12.9 - 13.5V)
-            if is_stable:
+            if low_current:
+                return "Storage"  # Holding storage setpoint with minimal current
+            elif is_stable:
                 return "Storage"
             else:
                 return "Bulk"
         elif voltage < self.V_STORAGE - self.V_SETPOINT_TOL:
-            # Below all setpoints — battery is being charged up
+            # Below all setpoints
+            if low_current:
+                return "Idle"  # No setpoint match + no current = truly idle
             return "Bulk"
         else:
-            # Fallback for gaps between zones
+            # Between setpoint zones
+            if low_current:
+                return "Idle"
             return "Bulk"
 
     def _is_voltage_stable(self) -> bool:
@@ -271,11 +285,56 @@ class VictronBLEMonitor:
         except Exception as e:
             log.warning("CMD %s failed: %s", item, e)
 
+    # ── BLE signal quality ────────────────────────────────────────────────
+    @staticmethod
+    def _rssi_to_quality(dbm: int) -> str:
+        """Convert RSSI dBm to human-readable quality string."""
+        if dbm >= -60:
+            quality = "Excellent"
+        elif dbm >= -70:
+            quality = "Good"
+        elif dbm >= -80:
+            quality = "Fair"
+        elif dbm >= -90:
+            quality = "Weak"
+        else:
+            quality = "Very Weak"
+        return f"{quality} ({dbm} dBm)"
+
+    # ── BLE RSSI scan ────────────────────────────────────────────────────
+    async def _scan_rssi(self) -> Optional[int]:
+        """Quick BLE scan to get RSSI for the charger.
+
+        Returns RSSI in dBm or None if charger not found.
+        Uses return_adv=True to get AdvertisementData which holds RSSI
+        (BLEDevice alone doesn't carry RSSI in bleak 2.x).
+        """
+        try:
+            devices = await BleakScanner.discover(
+                timeout=5.0, return_adv=True
+            )
+            for addr, (dev, adv) in devices.items():
+                if addr.upper() == CHARGER_ADDR.upper():
+                    log.info("BLE RSSI: %d dBm (charger %s)", adv.rssi, addr)
+                    return adv.rssi
+            log.debug("Charger not found in BLE scan")
+        except Exception as e:
+            log.warning("BLE RSSI scan failed: %s", e)
+        return None
+
     # ── Single poll cycle ────────────────────────────────────────────────
     async def _poll_once(self) -> bool:
         """Connect, collect data, parse, return True on success."""
         self._data_buffer = bytearray()
         self._disconnected = False
+
+        # Scan for RSSI before connecting (scan and GATT can't overlap)
+        rssi = await self._scan_rssi()
+        if rssi is not None:
+            await self._post_to_openhab(ITEMS["ble_rssi"], str(rssi))
+            await self._post_to_openhab(
+                ITEMS["ble_signal"], self._rssi_to_quality(rssi)
+            )
 
         client = BleakClient(
             CHARGER_ADDR,
