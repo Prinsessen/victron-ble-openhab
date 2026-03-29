@@ -73,6 +73,20 @@ Since the charger doesn't expose its internal state register, the charging phase
 
 **Voltage stability tracking:** A history of the last 10 voltage readings distinguishes Bulk (voltage rising through a setpoint zone) from actually being AT a stable setpoint.
 
+### BLE RSSI Monitoring
+
+Before each GATT connection, a quick BLE scan measures the signal strength (RSSI) of the charger. The raw dBm value is posted to `MC_Charger_BLE_RSSI`, and a human-readable quality label to `MC_Charger_BLE_Signal`:
+
+| dBm Range | Quality |
+|-----------|----------|
+| ≥ −60 | Excellent |
+| −60 to −70 | Good |
+| −70 to −80 | Fair |
+| −80 to −90 | Weak |
+| < −90 | Very Weak |
+
+Uses `BleakScanner.discover(return_adv=True)` — bleak 2.x requires `AdvertisementData` for RSSI (not available on `BLEDevice`).
+
 ### Offline Detection
 
 When the charger is disconnected from mains power, its BLE radio shuts off. After 3 consecutive failed BLE connection attempts (~90 seconds), the daemon:
@@ -152,6 +166,8 @@ Defined in `items/motorcycle_k7_power.items`:
 | `MC_Charger_Yield` | Number | Charged energy today (kWh) |
 | `MC_Charger_State` | String | Charge state (Off/Idle/Bulk/Absorption/Float/Storage/Recondition) |
 | `MC_Charger_Last_Update` | DateTime | Last successful data update |
+| `MC_Charger_BLE_RSSI` | Number | BLE signal strength in dBm (updated each poll cycle) |
+| `MC_Charger_BLE_Signal` | String | Human-readable signal quality, e.g. "Good (-70 dBm)" |
 
 ### Sitemap
 
