@@ -73,6 +73,10 @@ ITEMS = {
     "last_update": "MC_Charger_Last_Update",
     "ble_rssi":    "MC_Charger_BLE_RSSI",
     "ble_signal":  "MC_Charger_BLE_Signal",
+    # Proof D — secondary-connection via BLE data richness (diagnostic mirror)
+    "reg_count":   "MC_Charger_Reg_Count",
+    "data_bytes":  "MC_Charger_Data_Bytes",
+    "sec_proof":   "MC_Charger_Secondary_Proof",
 }
 
 # Victron register definitions: reg_id -> (name, dtype_expected, scale_fn)
@@ -122,6 +126,10 @@ class VictronBLEMonitor:
             "yield_kwh": None,
             "state": None,
         }
+        # Proof D — rolling history of the last 3 successful cycles' data
+        # richness (register count, byte count, whether any current register
+        # was present). Empirically the clamp-on vs clamp-off discriminator.
+        self._richness_history: list[dict] = []
 
     # ── BLE notification callbacks ───────────────────────────────────────
     def _on_notify(self, _sender, data: bytearray):
@@ -251,6 +259,38 @@ class VictronBLEMonitor:
             return True
         recent = self._voltage_history[-5:]  # Last 5 readings (~2.5 minutes)
         return (max(recent) - min(recent)) < 0.15
+
+    # ── Proof D: secondary connection via BLE data richness ──────────────
+    def _derive_secondary_proof(self) -> str:
+        """Infer secondary (DC clamp) connection from BLE data richness.
+
+        Empirically validated on this charger (2026-08-09 clamp on/off A/B
+        test). The charger has NO 'secondary connected' characteristic (Victron
+        confirmed, and 0xEDD5/0xEDD7 proved to be plain mirrors of the main
+        voltage/current). But the STREAM ITSELF changes with the clamp state,
+        because with the clamps off there is no real battery to regulate:
+
+          clamps ON  : 6-10 registers/cycle, 320-550 bytes, current registers present
+          clamps OFF : 1-2 registers/cycle, 140-190 bytes, current registers ABSENT
+
+        Single cycles are noisy (a connected full battery can briefly drop the
+        current registers), so we judge over the last 3 cycles:
+          - current seen in ANY of the last 3  -> Connected (hard: current flows)
+          - all 3 sparse (<=3 regs) with no current -> Off (clamps off bike?)
+          - otherwise -> Uncertain (settling / ambiguous)
+
+        CONSUMED BY THE JS RULE: this verdict is the PRIMARY input to
+        isSecondaryConnected() in vehicle-motorcycle-k7-power.js. "Connected
+        (current seen)" is treated as hard proof the clamps are on the bike.
+        """
+        h = self._richness_history
+        if not h:
+            return "Unknown"
+        if any(c["cur"] for c in h):
+            return "Connected (current seen)"
+        if len(h) >= 3 and all(c["regs"] <= 3 for c in h):
+            return "Off? (sparse data \u2014 clamps off)"
+        return "Uncertain (settling)"
 
     # ── openHAB REST API ─────────────────────────────────────────────────
     async def _post_to_openhab(self, item: str, value: str):
@@ -409,6 +449,25 @@ class VictronBLEMonitor:
     async def _process_results(self):
         """Parse collected data and post to openHAB."""
         raw_regs = self._parse_registers()
+
+        # ── Proof D: secondary-connection via BLE data richness ──────────
+        # Computed BEFORE the empty-register early-return so a fully sparse
+        # cycle (the clamps-off signature) still updates the diagnostic items.
+        reg_count = len(raw_regs)
+        data_bytes = len(self._data_buffer)
+        has_current = any(r in raw_regs for r in (0xED8C, 0xED8F, 0xEDD7))
+        self._richness_history.append(
+            {"regs": reg_count, "bytes": data_bytes, "cur": has_current}
+        )
+        if len(self._richness_history) > 3:
+            self._richness_history.pop(0)
+        proof = self._derive_secondary_proof()
+        await self._post_to_openhab(ITEMS["reg_count"], str(reg_count))
+        await self._post_to_openhab(ITEMS["data_bytes"], str(data_bytes))
+        await self._post_to_openhab(ITEMS["sec_proof"], proof)
+        log.info("Proof D: regs=%d bytes=%d cur=%s -> %s",
+                 reg_count, data_bytes, has_current, proof)
+
         if not raw_regs:
             log.warning("No register data parsed from %d bytes",
                         len(self._data_buffer))
@@ -520,11 +579,15 @@ class VictronBLEMonitor:
                 await self._post_to_openhab(ITEMS["current"], "0")
                 await self._post_to_openhab(ITEMS["current_ma"], "0")
                 await self._post_to_openhab(ITEMS["voltage"], "0")
+                await self._post_to_openhab(ITEMS["reg_count"], "0")
+                await self._post_to_openhab(ITEMS["data_bytes"], "0")
+                await self._post_to_openhab(ITEMS["sec_proof"], "Offline")
                 self._cache["state"] = "Off"
                 self._cache["current_a"] = 0.0
                 self._cache["current_ma"] = 0
                 self._cache["voltage"] = None
                 self._voltage_history.clear()
+                self._richness_history.clear()
 
     # ── Main loop ────────────────────────────────────────────────────────
     async def run(self):

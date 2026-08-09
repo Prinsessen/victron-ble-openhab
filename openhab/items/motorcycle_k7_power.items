@@ -66,7 +66,18 @@ Number   MC_Charger_Yield        "Charged Energy [%.3f kWh]"           <energy> 
 String   MC_Charger_State        "Charger State [%s]"                    <heating>       (gMC_K7_Power)  ["Status"]
 DateTime MC_Charger_Last_Update  "Charger Updated [%1$td.%1$tm %1$tH:%1$tM]" <time>     (gMC_K7_Power)  ["Status"]
 
-// --- Charge Session History (persisted to InfluxDB) ---
+// --- Proof D: Secondary-Connection via BLE Data Richness ---
+// The charger exposes NO 'secondary connected' register (Victron-confirmed;
+// 0xEDD5/0xEDD7 proved to be plain mirrors of the main voltage/current). But
+// the BLE STREAM changes with the clamp state: with the clamps on the bike,
+// charge-current registers appear in the cycle (current can only flow through a
+// closed circuit). The daemon derives a verdict from this and posts it here.
+// MC_Charger_Secondary_Proof is the PRIMARY clamp-on-bike input to the K7
+// rule's isSecondaryConnected(). Reg_Count/Data_Bytes are raw evidence kept
+// for history/forensics.
+Number   MC_Charger_Reg_Count       "BLE Registers/Cycle [%d]"           <energy>        (gMC_K7_Power)  ["Measurement"]
+Number   MC_Charger_Data_Bytes      "BLE Data/Cycle [%d B]"             <energy>        (gMC_K7_Power)  ["Measurement"]
+String   MC_Charger_Secondary_Proof "Proof D (Clamps) [%s]"             <network>       (gMC_K7_Power)  ["Status"]
 // Updated by vehicle-motorcycle-k7-charge-history.js on each charge cycle.
 DateTime MC_Charge_Session_Start   "Session Start [%1$td.%1$tm %1$tH:%1$tM]"  <time>      (gMC_K7_Power)  ["Status"]
 DateTime MC_Charge_Session_End     "Session End [%1$td.%1$tm %1$tH:%1$tM]"    <time>      (gMC_K7_Power)  ["Status"]

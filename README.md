@@ -95,6 +95,24 @@ When the charger is disconnected from mains power, its BLE radio shuts off. Afte
 - Clears `MC_Charger_Voltage` → `0`
 - Clears `MC_Charger_Current` → `0`
 - Clears `MC_Charger_Current_mA` → `0`
+- Sets `MC_Charger_Secondary_Proof` → `Offline` (see Secondary-Connection Detection below)
+
+### Secondary-Connection Detection (Proof D)
+
+The charger sits permanently on 230V mains, so "BLE online" says nothing about whether the DC clamps are actually on the bike battery. There is **no** register that reports this — Victron confirmed it, and `0xEDD5`/`0xEDD7` proved to be plain mirrors of the main voltage/current in a live clamp on/off A/B test (2026-08-09).
+
+The reliable discriminator is simply **whether charge current is flowing**, which the daemon reads from the BLE register stream. Current can only flow through a **closed circuit**, so "current seen" is a hard physical fact that the clamps are on the bike — and it holds even at a full battery, where the charger keeps pushing a small maintenance current.
+
+The daemon judges over the last 3 cycles and posts a verdict to `MC_Charger_Secondary_Proof`:
+
+| Verdict | Condition | Meaning |
+|---------|-----------|---------|
+| `Connected (current seen)` | current registers present in any of the last 3 cycles | Clamps on the bike (hard proof) |
+| `Off? (sparse data — clamps off)` | 3 sparse cycles (≤3 registers) with no current | Clamps off the bike |
+| `Uncertain (settling)` | ambiguous / transitioning | Treated as *off* by the K7 rule (a full battery draws no current, so the current registers vanish right after disconnect) |
+| `Offline` | charger BLE offline | No mains |
+
+This verdict is the **primary** input to `isSecondaryConnected()` in the K7 rule. It replaced an older voltage-delta method that could falsely read "connected" for up to half an hour at a full battery (open-circuit float ≈ resting battery voltage). `MC_Charger_Reg_Count` and `MC_Charger_Data_Bytes` are posted alongside as raw evidence.
 
 ## Deployment
 
@@ -168,6 +186,9 @@ Defined in `items/motorcycle_k7_power.items`:
 | `MC_Charger_Last_Update` | DateTime | Last successful data update |
 | `MC_Charger_BLE_RSSI` | Number | BLE signal strength in dBm (updated each poll cycle) |
 | `MC_Charger_BLE_Signal` | String | Human-readable signal quality, e.g. "Good (-70 dBm)" |
+| `MC_Charger_Secondary_Proof` | String | **Proof D** clamp-on-bike verdict (see Secondary-Connection Detection) |
+| `MC_Charger_Reg_Count` | Number | Registers parsed in the last BLE cycle (Proof D evidence) |
+| `MC_Charger_Data_Bytes` | Number | Bytes in the last BLE cycle (Proof D evidence) |
 
 ### Sitemap
 
