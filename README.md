@@ -1,6 +1,6 @@
 # Victron Blue Smart IP65 12/10 — BLE GATT Monitor
 
-Standalone BLE monitor daemon for the **Victron Blue Smart IP65 12/10** battery charger. Runs on a Raspberry Pi 4, connects via BLE GATT to read charger data, and posts values to openHAB REST API.
+Standalone BLE monitor daemon for the **Victron Blue Smart IP65 12/10** battery charger. Runs on a Raspberry Pi 3 Model B+, connects via BLE GATT to read charger data, and posts values to openHAB REST API.
 
 ## Hardware
 
@@ -10,9 +10,9 @@ Standalone BLE monitor daemon for the **Victron Blue Smart IP65 12/10** battery 
 | BLE Address | `AA:BB:CC:DD:EE:FF` |
 | BLE Name | "Springfield Charger" |
 | Manufacturer ID | `0x02E1` (Victron Energy) |
-| Host | Raspberry Pi 4 (`192.168.1.60`, user `pi`) |
-| BLE Adapter | hci0 (`B8:27:EB:79:D9:95`) |
-| openHAB | `192.168.1.100:8080` |
+| Host | Raspberry Pi 3 Model B+ (`192.168.1.60`, user `pi`) |
+| BLE Adapter | hci0 (`AA:BB:CC:DD:EE:FF`) |
+| openHAB | `192.168.1.21:8080` |
 
 ## How It Works
 
@@ -52,6 +52,27 @@ Where dtype: `0x42` = uint16 (2 bytes), `0x44` = uint32 (4 bytes), `0x41` = uint
 | `0xED8F` | u16 | × 0.1 | Battery Current (A) |
 | `0xEDDB` | u16 | ÷ 1000 | Yield Today (raw Wh → kWh) |
 | `0x0120` | u32 | raw | Timer/Counter (seconds) |
+
+### Writing: the charge preset restarts the cycle (2026-10-14)
+
+The IP65 has no on/off - not in VictronConnect, and a write to `0x0200` (device mode, as used
+for Phoenix inverters, `0603821902004104`) is acknowledged `07030602` and ignored. What it does
+have is the **charge preset**, register `0xEDF1`, captured from VictronConnect with an Android
+HCI snoop log. Written on the command characteristic `306b0003`:
+
+| Command | Meaning |
+|---------|---------|
+| `06008219edf14102` | preset = **High** |
+| `06008219edf14100` | preset = **Normal** (the one in use) |
+| `05008119edf1` | GET the preset (the app reads it before writing) |
+
+Not used, never write them: Normal + recondition, High + recondition (~16 V), Li-ion.
+
+Switching Normal -> High -> Normal restarts the charge algorithm: Storage -> Bulk -> Absorption.
+Proven with the owner watching the LEDs: a **full** battery in Storage (13.4 V, 0 mA) then took
+110-420 mA at 14.6 V, and Proof D said "current seen" - which is the clamp-on proof the passive
+detection cannot get from a full battery (see "Secondary connection" below). With the clamps
+off, no current can flow. Always end on Normal and read `0xEDF1` back.
 
 > **Note:** Register `0xEDD4` (native charger state) is NOT available over BLE GATT on this charger model. Explicit GET requests return error responses. The "Instant Readout" BLE advertisement feature is also not available on the Blue Smart IP65.
 
@@ -95,31 +116,13 @@ When the charger is disconnected from mains power, its BLE radio shuts off. Afte
 - Clears `MC_Charger_Voltage` → `0`
 - Clears `MC_Charger_Current` → `0`
 - Clears `MC_Charger_Current_mA` → `0`
-- Sets `MC_Charger_Secondary_Proof` → `Offline` (see Secondary-Connection Detection below)
-
-### Secondary-Connection Detection (Proof D)
-
-The charger sits permanently on 230V mains, so "BLE online" says nothing about whether the DC clamps are actually on the bike battery. There is **no** register that reports this — Victron confirmed it, and `0xEDD5`/`0xEDD7` proved to be plain mirrors of the main voltage/current in a live clamp on/off A/B test (2026-08-09).
-
-The reliable discriminator is simply **whether charge current is flowing**, which the daemon reads from the BLE register stream. Current can only flow through a **closed circuit**, so "current seen" is a hard physical fact that the clamps are on the bike — and it holds even at a full battery, where the charger keeps pushing a small maintenance current.
-
-The daemon judges over the last 3 cycles and posts a verdict to `MC_Charger_Secondary_Proof`:
-
-| Verdict | Condition | Meaning |
-|---------|-----------|---------|
-| `Connected (current seen)` | current registers present in any of the last 3 cycles | Clamps on the bike (hard proof) |
-| `Off? (sparse data — clamps off)` | 3 sparse cycles (≤3 registers) with no current | Clamps off the bike |
-| `Uncertain (settling)` | ambiguous / transitioning | Treated as *off* by the K7 rule (a full battery draws no current, so the current registers vanish right after disconnect) |
-| `Offline` | charger BLE offline | No mains |
-
-This verdict is the **primary** input to `isSecondaryConnected()` in the K7 rule. It replaced an older voltage-delta method that could falsely read "connected" for up to half an hour at a full battery (open-circuit float ≈ resting battery voltage). `MC_Charger_Reg_Count` and `MC_Charger_Data_Bytes` are posted alongside as raw evidence.
 
 ## Deployment
 
 ### Pi Setup
 
 ```bash
-# On Pi 4 (192.168.1.60)
+# On Pi 3 (192.168.1.60)
 mkdir -p /home/pi/victron-ble
 python3 -m venv /home/pi/victron-ble/.venv
 source /home/pi/victron-ble/.venv/bin/activate
@@ -186,9 +189,10 @@ Defined in `items/motorcycle_k7_power.items`:
 | `MC_Charger_Last_Update` | DateTime | Last successful data update |
 | `MC_Charger_BLE_RSSI` | Number | BLE signal strength in dBm (updated each poll cycle) |
 | `MC_Charger_BLE_Signal` | String | Human-readable signal quality, e.g. "Good (-70 dBm)" |
-| `MC_Charger_Secondary_Proof` | String | **Proof D** clamp-on-bike verdict (see Secondary-Connection Detection) |
-| `MC_Charger_Reg_Count` | Number | Registers parsed in the last BLE cycle (Proof D evidence) |
-| `MC_Charger_Data_Bytes` | Number | Bytes in the last BLE cycle (Proof D evidence) |
+| `MC_Charger_Secondary_Proof` | String | **Proof D** verdict — are the DC clamps on the bike? See below |
+| `MC_Secondary_Connected` | Switch | Boolean clamp truth derived from Proof D (consumed by the JS rule) |
+| `MC_Charger_Reg_Count` | Number | BLE registers/cycle (A/B-test evidence, InfluxDB history only) |
+| `MC_Charger_Data_Bytes` | Number | BLE data bytes/cycle (A/B-test evidence, InfluxDB history only) |
 
 ### Sitemap
 
@@ -201,11 +205,13 @@ All configuration is at the top of `victron_ble_monitor.py`:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `CHARGER_ADDR` | `AA:BB:CC:DD:EE:FF` | BLE MAC address of charger |
-| `OPENHAB_URL` | `http://192.168.1.100:8080/rest/items` | openHAB REST endpoint |
+| `OPENHAB_URL` | `http://192.168.1.21:8080/rest/items` | openHAB REST endpoint |
 | `POLL_INTERVAL` | `30` | Seconds between BLE poll cycles |
 | `DATA_COLLECT_TIME` | `12` | Seconds to collect data per connection |
 | `OFFLINE_THRESHOLD` | `3` | Consecutive failures before marking offline |
 | `MAX_RETRIES` | `2` | Retries per poll cycle |
+| `CURRENT_MEMORY_SEC` | `14400` | Proof D: hold "Connected" this long after a current pulse (4 h) |
+| `STARTUP_GRACE_SEC` | `3600` | Proof D: optimistic "Connected" window after a restart (1 h) |
 
 ### Charge Profile Setpoints
 
@@ -217,6 +223,78 @@ Factory default for 12V lead-acid (configurable as class constants):
 | Float | 13.8V |
 | Storage | 13.2V |
 | Tolerance | ± 0.3V |
+
+## Proof D — Secondary-Connection (Clamp) Detection
+
+"Is the charger powered on 230V?" is easy (BLE online). The harder, drain-
+preventing question is **"are the DC clamps physically on the bike battery?"**
+The Blue Smart IP65 exposes **no** 'secondary connected' register (Victron-
+confirmed; `0xEDD5`/`0xEDD7` proved to be plain mirrors of the main
+voltage/current in a live clamp on/off A/B test on 2026-08-09).
+
+**The insight:** the BLE stream itself changes with the clamp state, because
+with the clamps off there is no real battery to regulate. Crucially, **charge-
+current registers (`0xED8C`/`0xED8F`/`0xEDD7`) only appear when current is
+actually flowing — and current can only flow through a closed circuit.** So
+"current seen" is hard physical proof the clamps are on the bike.
+
+### `MC_Charger_Secondary_Proof` verdicts
+
+| Verdict | Meaning |
+|---------|---------|
+| `Connected (current seen)` | Current in one of the last 3 BLE cycles — clamps on (hard proof) |
+| `Connected (pulse Nm ago)` | No current now, but a pulse `N` min ago still within the memory window — clamps on |
+| `Connected (startup grace)` | Just restarted, no pulse yet — optimistically connected for `STARTUP_GRACE_SEC` |
+| `Uncertain (settling)` | Ambiguous cycle, no current, no recent pulse |
+| `Off? (sparse data — clamps off)` | 3 sparse cycles, no current, no recent pulse — clamps off |
+| `Offline` | Charger BLE offline (no mains) |
+
+The daemon posts this verdict; `isSecondaryConnected()` in
+`vehicle-motorcycle-k7-power.js` consumes it as the **primary** input and writes
+the boolean `MC_Secondary_Connected`, which in turn drives the Springfield
+"connect the charger" reminder in `vehicle-springfield-ble-presence.js`.
+
+### Current-pulse memory (`CURRENT_MEMORY_SEC`, added 2026-09-01)
+
+**Problem:** in **Storage on a full battery** the charger emits a visible
+maintenance-current pulse only **rarely** — gaps of **30+ minutes** were observed
+live, growing sparser the fuller the battery is — with genuine 0 mA stretches in
+between. Judging only the last 3 BLE cycles (~2 min), Proof D flapped
+`Connected → Uncertain → Off?` across every gap, dragged `MC_Secondary_Connected`
+OFF, and when a gap exceeded the 30-min reminder grace it fired a **false
+"Victron lader ikke tilsluttet"** email even though the clamps were on the bike.
+
+**Fix:** a current pulse is HARD proof of a closed circuit (clamps on), so the
+proof does not need frequent renewal. The daemon remembers the timestamp of the
+last cycle in which current was seen and holds the `Connected` verdict for up to
+`CURRENT_MEMORY_SEC` (default **14400 s = 4 h**), which comfortably bridges any
+realistic Storage pulse gap while staying well inside an overnight window.
+
+**Why a long window is safe for drain detection:**
+
+| Case | Behaviour |
+|------|-----------|
+| Never plugged in | Charger emits **no** pulse → memory never starts → reminder still fires in 30 min (unchanged) |
+| Clamps on, sparse Storage pulses | One pulse latches `Connected` for hours → **no false reminder** |
+| Clamps unplugged mid-session | Caught when the window ages out (hours) — fine for battery health, still inside overnight |
+
+The window only relaxes the **already-proven-connected** case, never the
+dangerous never-connected case. A voltage-delta discriminator was rejected
+(team A/B test 2026-08-09: it false-positives at a full battery, where the
+charger open-circuit voltage ≈ resting battery voltage). The memory is cleared
+when the charger goes offline (mains lost).
+
+### Startup grace (`STARTUP_GRACE_SEC`, added 2026-09-01)
+
+After a daemon or Pi restart the pulse memory is empty. Because deep-Storage
+pulse gaps can be 45+ min, a restart landing mid-gap would flip
+`MC_Secondary_Connected` OFF until the next pulse and risk a false reminder.
+For the first `STARTUP_GRACE_SEC` (default **3600 s = 1 h**) the daemon reports
+`Connected (startup grace)` while the charger is online but no pulse has yet
+been seen. This makes routine restarts seamless, is bounded to ~1 h so a genuine
+clamps-off at restart is still caught soon after (comparable to the 30-min
+reminder grace), and never masks a mains loss — the offline path reports
+`Offline` before the grace is reached.
 
 ## BLE Services Reference
 

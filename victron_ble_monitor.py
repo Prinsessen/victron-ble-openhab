@@ -49,13 +49,65 @@ from bleak import BleakClient, BleakError, BleakScanner
 
 # ── Configuration ────────────────────────────────────────────────────────────
 CHARGER_ADDR = "AA:BB:CC:DD:EE:FF"
-OPENHAB_URL = "http://192.168.1.100:8080/rest/items"
+OPENHAB_URL = "http://192.168.1.21:8080/rest/items"
 POLL_INTERVAL = 30          # seconds between connection cycles
 CONNECT_TIMEOUT = 10        # BLE connect timeout
 DATA_COLLECT_TIME = 12      # seconds to collect data after init (voltage arrives late)
 KEEPALIVE_INTERVAL = 1.5    # seconds between keepalives during collection
 OFFLINE_THRESHOLD = 3       # consecutive failures before marking offline
+# Proof D current-pulse memory: how long a single "current seen" pulse keeps
+# proving the clamps are on the bike. A current pulse is HARD proof of a closed
+# circuit (clamps on). In Storage on a FULL battery the charger emits a visible
+# maintenance-current pulse only rarely — gaps of 30+ min were observed live on
+# 2026-09-01, and can be longer the fuller the battery is. Without a long-
+# enough window Proof D flaps Connected->Uncertain->Off? across those gaps,
+# drags MC_Secondary_Connected OFF and fires a false "charger not connected"
+# reminder. 4 h comfortably bridges any realistic Storage gap.
+#
+# Why a long window is SAFE for drain detection:
+#   - "Never plugged in" produces NO pulse at all -> memory never starts ->
+#     the reminder still fires promptly (30-min grace). Unaffected.
+#   - "Clamps unplugged mid-session" is caught when the window ages out (hours),
+#     which is fine for battery health and still well inside an overnight window.
+# The window only relaxes the already-proven-connected case, never the
+# dangerous never-connected case.
+CURRENT_MEMORY_SEC = 14400  # 4 h: hold "Connected" across deep-Storage pulse gaps
+# Startup grace: after a daemon/Pi restart the pulse memory is empty, so a
+# restart that lands mid-gap (Storage pulses can be 45+ min apart) would flip
+# MC_Secondary_Connected OFF until the next pulse and risk a false reminder.
+# For the first STARTUP_GRACE_SEC we optimistically assume "connected" so a
+# routine restart/reboot is seamless. Bounded to ~1 h so a genuine clamps-off
+# at restart is still caught soon after — comparable to the 30-min reminder
+# grace, and negligible against the overnight timescale the feature protects.
+# Does NOT apply when the charger is offline (no mains): that path reports
+# "Offline" directly and never reaches the grace.
+STARTUP_GRACE_SEC = 3600    # 1 h optimistic "connected" grace after a restart
 MAX_RETRIES = 2             # retries per poll cycle
+
+# ── The prick (2026-10-14) ──────────────────────────────────────────────────
+# A full battery in Storage takes no current, so Proof D cannot tell clamps-on
+# from clamps-off once CURRENT_MEMORY_SEC has run out. The charger cannot be
+# switched off over BLE (0x0200 is ignored), but its charge PRESET can be set
+# (register 0xEDF1, bytes captured from VictronConnect with an HCI snoop), and
+# Normal -> High -> Normal restarts the charge algorithm: Storage -> Bulk ->
+# Absorption. A battery on the clamps then takes 100-400 mA even when full
+# (proven 2026-10-14); with the clamps off nothing can flow. So when the verdict
+# drops to Off?/Uncertain, prick once and let the next cycles' current decide.
+# ONLY FROM STORAGE: in Absorption (14.4-14.7 V) a prick cannot raise the voltage,
+# so a full battery takes nothing and "no current" proves nothing - seen on the
+# first manual test, 2026-10-14 21:05. Automatic pricks wait for Storage; a
+# manual one from another state reports "not conclusive" instead of "clamps off".
+# Only ever touches the charger when the preset reads Normal, and always ends on
+# Normal, read back. Recondition and Li-ion are never written.
+PRESET_MARK = bytes.fromhex("080019edf141")   # a 0xEDF1 value follows this
+PRESET_NORMAL = 0x00
+PRESET_HIGH = 0x02
+CMD_PRESET_GET = "05008119edf1"
+CMD_PRESET_HIGH = "06008219edf14102"
+CMD_PRESET_NORMAL = "06008219edf14100"
+PRICK_MIN_INTERVAL_SEC = 12 * 3600  # automatic pricks at most every 12 h
+PRICK_EVAL_SEC = 600                # current must show within 10 min of a prick
+PRICK_KEEPALIVE_SEC = 1.0           # the charger drops a link on slower keepalives
 
 # BLE GATT UUIDs (Victron 306b service)
 CHAR_INIT = "306b0002-b081-4037-83dc-e59fcc3cdfd0"
@@ -77,6 +129,8 @@ ITEMS = {
     "reg_count":   "MC_Charger_Reg_Count",
     "data_bytes":  "MC_Charger_Data_Bytes",
     "sec_proof":   "MC_Charger_Secondary_Proof",
+    "prick":       "MC_Charger_Prick",           # ON = prick now (manual), daemon resets it
+    "prick_result": "MC_Charger_Prick_Result",
 }
 
 # Victron register definitions: reg_id -> (name, dtype_expected, scale_fn)
@@ -130,6 +184,21 @@ class VictronBLEMonitor:
         # richness (register count, byte count, whether any current register
         # was present). Empirically the clamp-on vs clamp-off discriminator.
         self._richness_history: list[dict] = []
+        # Monotonic timestamp of the most recent cycle in which charge current
+        # was seen. Powers the CURRENT_MEMORY_SEC window in Proof D so a full
+        # battery's sparse Storage pulses don't flap the verdict (see below).
+        self._last_current_seen_ts: Optional[float] = None
+        # Process start time, for the STARTUP_GRACE_SEC optimistic-connected
+        # window that keeps a restart from flapping MC_Secondary_Connected OFF
+        # before the first post-restart current pulse arrives.
+        self._startup_ts: float = time.monotonic()
+        # The prick: why one is due ("auto"/"manual"), when the last one ran,
+        # and until when the following cycles are watched for current.
+        self._prick_pending: Optional[str] = None
+        self._last_prick_ts: Optional[float] = None
+        self._prick_eval_until: Optional[float] = None
+        self._prick_stamp = ""
+        self._prick_from = "Unknown"   # charger state when the prick was made
 
     # ── BLE notification callbacks ───────────────────────────────────────
     def _on_notify(self, _sender, data: bytearray):
@@ -276,7 +345,9 @@ class VictronBLEMonitor:
         Single cycles are noisy (a connected full battery can briefly drop the
         current registers), so we judge over the last 3 cycles:
           - current seen in ANY of the last 3  -> Connected (hard: current flows)
-          - all 3 sparse (<=3 regs) with no current -> Off (clamps off bike?)
+          - else a pulse within CURRENT_MEMORY_SEC -> Connected (full battery in
+            Storage pulses maintenance current only rarely; 30+ min gaps seen)
+          - all 3 sparse (<=3 regs) with no current + no recent pulse -> Off
           - otherwise -> Uncertain (settling / ambiguous)
 
         CONSUMED BY THE JS RULE: this verdict is the PRIMARY input to
@@ -286,11 +357,153 @@ class VictronBLEMonitor:
         h = self._richness_history
         if not h:
             return "Unknown"
+        # Fast path: current in any of the last 3 cycles -> hard proof, on now.
         if any(c["cur"] for c in h):
             return "Connected (current seen)"
+        # Memory path: a recent current pulse still proves the clamps are on.
+        # In Storage on a full battery the charger pulses maintenance current
+        # only rarely (30+ min gaps observed, longer when very full), leaving
+        # long genuine-zero stretches. Hold "Connected" across them (up to
+        # CURRENT_MEMORY_SEC) so MC_Secondary_Connected stays stable and no
+        # false "charger disconnected" reminder fires. A truly disconnected
+        # charger has NO pulses, so this never starts and the real clamps-off
+        # case is still caught.
+        if self._last_current_seen_ts is not None:
+            age = time.monotonic() - self._last_current_seen_ts
+            if age <= CURRENT_MEMORY_SEC:
+                return f"Connected (pulse {int(age // 60)}m ago)"
+        # Startup grace: right after a restart the pulse memory is empty. Rather
+        # than flap OFF until the (possibly 45+ min away) next pulse, assume
+        # connected for STARTUP_GRACE_SEC. Only reached when the charger is
+        # online (offline is handled earlier), so this never masks a mains loss.
+        if (time.monotonic() - self._startup_ts) <= STARTUP_GRACE_SEC:
+            return "Connected (startup grace)"
         if len(h) >= 3 and all(c["regs"] <= 3 for c in h):
             return "Off? (sparse data \u2014 clamps off)"
         return "Uncertain (settling)"
+
+    # ── The prick ─────────────────────────────────────────────────────────
+    async def _judge_prick(self, proof: str, has_current: bool):
+        """After a prick: did current come? Otherwise: is a prick due?"""
+        now = time.monotonic()
+        if self._prick_eval_until is not None:
+            if has_current:
+                self._prick_eval_until = None
+                await self._prick_result(f"{self._prick_stamp} current seen - clamps on the bike")
+            elif now > self._prick_eval_until:
+                self._prick_eval_until = None
+                if self._prick_from == "Storage":
+                    await self._prick_result(f"{self._prick_stamp} no current after the prick - clamps off")
+                else:
+                    await self._prick_result(f"{self._prick_stamp} no current - not conclusive, "
+                                             f"charger was in {self._prick_from} (only a prick from Storage decides)")
+            return
+        if not (proof.startswith("Off") or proof.startswith("Uncertain")):
+            return
+        if self._cache.get("state") != "Storage":
+            return
+        if self._last_prick_ts is not None and now - self._last_prick_ts < PRICK_MIN_INTERVAL_SEC:
+            return
+        self._prick_pending = self._prick_pending or "auto"
+
+    async def _prick_result(self, text: str):
+        log.info("Prick: %s", text)
+        await self._post_to_openhab(ITEMS["prick_result"], text)
+
+    async def _check_manual_prick(self):
+        """MC_Charger_Prick ON from openHAB = prick on this cycle."""
+        url = f"{OPENHAB_URL}/{ITEMS['prick']}/state"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    state = (await resp.text()).strip() if resp.status == 200 else ""
+        except Exception:
+            return
+        if state == "ON":
+            self._prick_pending = "manual"
+            await self._post_to_openhab(ITEMS["prick"], "OFF")
+
+    async def _prick(self):
+        """Preset Normal -> High -> Normal in one short connection, each step read back."""
+        why, self._prick_pending = self._prick_pending, None
+        self._last_prick_ts = time.monotonic()   # attempts count too: no retry storm
+        self._prick_stamp = time.strftime("%d/%m %H:%M")
+        self._prick_from = self._cache.get("state") or "Unknown"
+        stamp = self._prick_stamp
+        buf = bytearray()
+
+        def note(_sender, data: bytearray):
+            buf.extend(data)
+
+        def preset() -> Optional[int]:
+            i = buf.rfind(PRESET_MARK)
+            return buf[i + len(PRESET_MARK)] if i >= 0 and i + len(PRESET_MARK) < len(buf) else None
+
+        client = BleakClient(CHARGER_ADDR, timeout=CONNECT_TIMEOUT)
+
+        async def send(cmd: str, hold: float):
+            await client.write_gatt_char(CHAR_CMD, bytes.fromhex(cmd), response=False)
+            end = time.monotonic() + hold
+            while time.monotonic() < end:
+                await client.write_gatt_char(CHAR_INIT, bytes.fromhex("f941"), response=False)
+                await asyncio.sleep(PRICK_KEEPALIVE_SEC)
+
+        high_sent = False
+        result = f"{stamp} prick failed"
+        try:
+            await client.connect()
+            for char_uuid in (CHAR_INIT, CHAR_CMD, CHAR_BULK):
+                await client.start_notify(char_uuid, note)
+            for cmd in ("fa80ff", "f980", "01"):
+                await client.write_gatt_char(CHAR_INIT, bytes.fromhex(cmd), response=False)
+                await asyncio.sleep(0.3)
+            await client.write_gatt_char(CHAR_CMD, bytes.fromhex("01"), response=False)
+            await asyncio.sleep(0.2)
+            await client.write_gatt_char(CHAR_CMD, bytes.fromhex("0300"), response=False)
+            await asyncio.sleep(1.0)
+
+            buf.clear()
+            await send(CMD_PRESET_GET, 1.0)
+            before = preset()
+            if before != PRESET_NORMAL:
+                result = f"{stamp} skipped - preset reads {before}, not Normal; left alone"
+                return
+            buf.clear()
+            high_sent = True
+            await send(CMD_PRESET_HIGH, 0.5)
+            await send(CMD_PRESET_GET, 2.5)
+            high = preset()
+            buf.clear()
+            await send(CMD_PRESET_NORMAL, 0.5)
+            await send(CMD_PRESET_GET, 1.5)
+            after = preset()
+            if after != PRESET_NORMAL:
+                buf.clear()
+                await send(CMD_PRESET_NORMAL, 0.5)
+                await send(CMD_PRESET_GET, 1.5)
+                after = preset()
+            if after != PRESET_NORMAL:
+                result = f"{stamp} ALERT - preset reads {after} after the prick, not Normal"
+                log.error("Prick: preset not back on Normal (%s)", after)
+            elif high != PRESET_HIGH:
+                result = f"{stamp} High not confirmed (read {high}); preset Normal"
+            else:
+                self._prick_eval_until = time.monotonic() + PRICK_EVAL_SEC
+                result = f"{stamp} pricked ({why}, from {self._prick_from}) - watching for current"
+        except Exception as e:
+            result = f"{stamp} prick failed: {e}"
+            if high_sent and client.is_connected:
+                try:
+                    await send(CMD_PRESET_NORMAL, 1.0)
+                except Exception:
+                    pass
+        finally:
+            try:
+                if client.is_connected:
+                    await client.disconnect()
+            except Exception:
+                pass
+            await self._prick_result(result)
 
     # ── openHAB REST API ─────────────────────────────────────────────────
     async def _post_to_openhab(self, item: str, value: str):
@@ -456,6 +669,8 @@ class VictronBLEMonitor:
         reg_count = len(raw_regs)
         data_bytes = len(self._data_buffer)
         has_current = any(r in raw_regs for r in (0xED8C, 0xED8F, 0xEDD7))
+        if has_current:
+            self._last_current_seen_ts = time.monotonic()
         self._richness_history.append(
             {"regs": reg_count, "bytes": data_bytes, "cur": has_current}
         )
@@ -467,6 +682,7 @@ class VictronBLEMonitor:
         await self._post_to_openhab(ITEMS["sec_proof"], proof)
         log.info("Proof D: regs=%d bytes=%d cur=%s -> %s",
                  reg_count, data_bytes, has_current, proof)
+        await self._judge_prick(proof, has_current)
 
         if not raw_regs:
             log.warning("No register data parsed from %d bytes",
@@ -588,6 +804,9 @@ class VictronBLEMonitor:
                 self._cache["voltage"] = None
                 self._voltage_history.clear()
                 self._richness_history.clear()
+                # Drop the pulse memory too: once mains is gone the previous
+                # pulse no longer proves anything about the next session.
+                self._last_current_seen_ts = None
 
     # ── Main loop ────────────────────────────────────────────────────────
     async def run(self):
@@ -596,6 +815,11 @@ class VictronBLEMonitor:
         log.info("openHAB: %s  poll interval: %ds", OPENHAB_URL, POLL_INTERVAL)
 
         while self.running:
+            await self._check_manual_prick()
+            if self._prick_pending:
+                await self._prick()
+                await asyncio.sleep(3)
+
             success = False
             for attempt in range(1, MAX_RETRIES + 1):
                 if not self.running:
