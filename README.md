@@ -450,7 +450,7 @@ The BLE charger data is the **primary sensor** for the INNOVV K7 auto-dump state
 | Sensor | Role | Source |
 |--------|------|--------|
 | **BLE charger state** | Primary authority | This daemon → `MC_Charger_BLE_Online` + `MC_Charger_State` |
-| **Shelly ADC voltage** | Fallback (when BLE offline) | Shelly Plus Uni Voltmeter:100 → `MC_K7_Shelly_Voltage` |
+| **Battery voltage** | Fallback (when BLE offline) | The GPS tracker's reading of the bike battery → `Vehicle10_Power` (the Shelly Plus Uni ADC until 2026-09-12; it now measures the relay coil's current, `MC_K7_Shelly_Voltage`) |
 
 ### Key Integration Points
 
@@ -460,6 +460,7 @@ The BLE charger data is the **primary sensor** for the INNOVV K7 auto-dump state
 - **Stabilisation authority** — During 60s stabilisation, BLE online + `isBLEConnected()` (charging OR Storage/Idle) = confirm. BLE online + not connected = reject (false positive from voltage spike).
 - **Three detection tiers** — `isBLECharging()` (active) → `isBLEConnected()` (Storage/Idle included) → voltage fallback. Used in post-ignition check, `startChargerSequence`, and stabilisation.
 - **Grace period** — After re-arm to PARKED, voltage-only charger detection suppressed for 5 minutes (battery voltage lingers > 13.0V). BLE always overrides.
+- **Clamps on the bike** — the tiers above say whether the charger is on mains and charging; whether its clamps are on the battery is `MC_Secondary_Connected`, from Proof D and the prick (see above).
 
 ### MC_Charger_Connection States
 
