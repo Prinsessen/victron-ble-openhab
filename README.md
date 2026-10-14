@@ -71,8 +71,38 @@ Not used, never write them: Normal + recondition, High + recondition (~16 V), Li
 Switching Normal -> High -> Normal restarts the charge algorithm: Storage -> Bulk -> Absorption.
 Proven with the owner watching the LEDs: a **full** battery in Storage (13.4 V, 0 mA) then took
 110-420 mA at 14.6 V, and Proof D said "current seen" - which is the clamp-on proof the passive
-detection cannot get from a full battery (see "Secondary connection" below). With the clamps
-off, no current can flow. Always end on Normal and read `0xEDF1` back.
+detection cannot get from a full battery. With the clamps off, no current can flow. The daemon
+uses this as **the prick** - see "The prick" under Proof D below.
+
+Each write is acknowledged with the new value (`...080019edf14102`), and a GET returns
+`080019edf141<value>`, so every step can be read back.
+
+#### How the preset command was found (Bluetooth HCI snoop)
+
+Olen's protocol work covers reading; nothing published covered writing a setting on the
+IP65, and his Phoenix on/off write did nothing here. So the command was taken from the
+official app while it did the thing:
+
+1. **Capture.** On an Android phone: Developer options -> *Enable Bluetooth HCI snoop log*,
+   then Bluetooth off and on (many phones only start the log then). Stop anything else that
+   holds the charger's BLE link (here: `sudo systemctl stop victron-ble-monitor` on the Pi).
+   Open VictronConnect, change the setting once (preset Normal -> High -> Normal), note the
+   time, and watch the charger's LEDs to see what the change does.
+2. **Collect.** Developer options -> *Bug report* -> *Full report*. The log is
+   `FS/data/log/bt/btsnoop_hci.log` inside the zip (the path varies by phone).
+3. **Read.** `python3 btsnoop_writes.py btsnoop_hci.log` lists the GATT writes the phone sent,
+   minus the connect sequence, keepalive, poll and register reads. What is left is the
+   command: on 2026-10-14, exactly four writes at the two preset changes, done twice -
+   `06008219edf14102` (High) and `06008219edf14100` (Normal).
+4. **Replay.** Send the same bytes from the Pi on the same characteristic (`306b0003`) and
+   read the register back (`05008119edf1`) to prove the charger took it.
+
+A VE.Direct-over-BLE register write reads `06 00 82 19 <reg lo> <reg hi> 41 <value>` - byte 2
+is `00` in everything the app sends (Olen's inverter command has `03` there). The same
+method should find any other setting VictronConnect can change.
+
+The bug report and the log hold the phone's other Bluetooth traffic and much more - extract
+the one file, delete the rest, never publish either.
 
 > **Note:** Register `0xEDD4` (native charger state) is NOT available over BLE GATT on this charger model. Explicit GET requests return error responses. The "Instant Readout" BLE advertisement feature is also not available on the Blue Smart IP65.
 
@@ -193,6 +223,8 @@ Defined in `items/motorcycle_k7_power.items`:
 | `MC_Secondary_Connected` | Switch | Boolean clamp truth derived from Proof D (consumed by the JS rule) |
 | `MC_Charger_Reg_Count` | Number | BLE registers/cycle (A/B-test evidence, InfluxDB history only) |
 | `MC_Charger_Data_Bytes` | Number | BLE data bytes/cycle (A/B-test evidence, InfluxDB history only) |
+| `MC_Charger_Prick` | Switch | ON = prick on the next cycle (manual); the daemon switches it back OFF |
+| `MC_Charger_Prick_Result` | String | What the last prick did and what it proved, e.g. "14/10 21:05 current seen - clamps on the bike" |
 
 ### Sitemap
 
@@ -212,6 +244,8 @@ All configuration is at the top of `victron_ble_monitor.py`:
 | `MAX_RETRIES` | `2` | Retries per poll cycle |
 | `CURRENT_MEMORY_SEC` | `14400` | Proof D: hold "Connected" this long after a current pulse (4 h) |
 | `STARTUP_GRACE_SEC` | `3600` | Proof D: optimistic "Connected" window after a restart (1 h) |
+| `PRICK_MIN_INTERVAL_SEC` | `43200` | The prick: automatic pricks at most every 12 h |
+| `PRICK_EVAL_SEC` | `600` | The prick: current must show within 10 min to prove the clamps on |
 
 ### Charge Profile Setpoints
 
@@ -296,6 +330,46 @@ clamps-off at restart is still caught soon after (comparable to the 30-min
 reminder grace), and never masks a mains loss — the offline path reports
 `Offline` before the grace is reached.
 
+### The prick (added 2026-10-14)
+
+**Problem:** the memory only bridges gaps. When a full battery sits in Storage
+for more than `CURRENT_MEMORY_SEC` without a pulse, the verdict falls to
+`Uncertain`/`Off?` with the clamps still on, and the reminder fires falsely
+("Springfield — Husk Laderen!"). Every proof above is passive, and with 230 V
+always on nothing ever happens to measure.
+
+**Fix:** make something happen. The charger cannot be switched off over BLE,
+but its charge preset can be set (register `0xEDF1`, see "Writing" above), and
+Normal -> High -> Normal restarts the cycle. A battery on the clamps then takes
+100-400 mA even when full, which the next cycles see as `current seen`. With the
+clamps off there is no circuit and no current.
+
+**When the daemon pricks:**
+
+| Condition | Why |
+|-----------|-----|
+| Verdict is `Uncertain` or `Off?` | Only when in doubt — a `Connected` verdict needs no prick |
+| Charger state is **Storage** | From Absorption (14.4-14.7 V) a prick cannot raise the voltage, so a full battery takes nothing and "no current" proves nothing. Seen on the first manual test: the clamps were on, the charger was in Absorption, and the result wrongly said "clamps off" |
+| Last prick more than 12 h ago | Each prick gives a full battery a short extra Absorption; the charger does one a week by itself |
+| `MC_Charger_Prick` ON | A manual prick, any state — the result says "not conclusive" unless it was made from Storage |
+
+**Safety:** the prick reads the preset first and leaves the charger alone
+unless it reads **Normal**. It writes High, reads it back, writes Normal, reads
+it back, and writes Normal again if the read-back is anything else (reported as
+`ALERT` in the result). Recondition and Li-ion are never written. One short BLE
+connection (the charger drops links after ~12 s; keepalive every 1 s).
+
+**Results** in `MC_Charger_Prick_Result`:
+
+| Result | Meaning |
+|--------|---------|
+| `… pricked (auto, from Storage) - watching for current` | Done, waiting up to `PRICK_EVAL_SEC` |
+| `… current seen - clamps on the bike` | Proof D also turns `Connected (current seen)` — reminder cancelled |
+| `… no current after the prick - clamps off` | From Storage: the clamps are off, the reminder is right |
+| `… no current - not conclusive, charger was in X` | A manual prick from another state |
+| `… skipped - preset reads N, not Normal; left alone` | Someone set another preset; the daemon does not touch it |
+| `… ALERT - preset reads N after the prick, not Normal` | Check the charger in VictronConnect |
+
 ## BLE Services Reference
 
 Full service enumeration of the Blue Smart IP65 12/10:
@@ -328,7 +402,8 @@ victron-ble/
 ├── README.md                       # This file
 ├── victron_ble_monitor.py          # Daemon source (reference copy)
 ├── victron-ble-monitor.service     # Systemd service file
-└── requirements.txt                # Python dependencies
+├── requirements.txt                # Python dependencies
+└── btsnoop_writes.py               # Lists an app's GATT writes from an Android HCI snoop log
 
 # Deployed on Pi (192.168.1.60):
 /home/pi/victron-ble/
@@ -355,6 +430,11 @@ sitemaps/myhouse.sitemap            # Victron Charger frame
 **State shows "Unknown"**
 - Occurs when no voltage data has been received yet (first poll after restart)
 - Should resolve after 1-2 poll cycles
+
+**The prick never runs**
+- It needs the verdict `Uncertain`/`Off?` AND the charger in Storage AND 12 h since the last one
+- Right after a restart the verdict is `Connected (startup grace)` for 1 h — no prick
+- Press "Probe charger now" (`MC_Charger_Prick`) to prick by hand; watch `journalctl -u victron-ble-monitor | grep Prick`
 
 **Charger shows "Bulk" but LED says "Float"**
 - Check that charge profile setpoints match your charger configuration
@@ -399,6 +479,9 @@ See `innovv-k7/K7_AUTO_POWER_README.md` for full state machine documentation.
 **Author:** Nanna Agesen ([@Prinsessen](https://github.com/Prinsessen)) — Nanna@agesen.dk
 
 **BLE Protocol Reference:** [Olen](https://github.com/Olen) — Victron BLE GATT protocol reverse engineering via [VictronConnect / phoenix.py](https://github.com/Olen/solar-monitor). The init sequence, register map, and data packet format used in this daemon are based on Olen's work.
+
+**Charge-preset write (`0xEDF1`) and the prick:** found by the author with an Android HCI snoop
+of VictronConnect, 2026-10-14 (see "How the preset command was found").
 
 ## License
 
