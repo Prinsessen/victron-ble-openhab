@@ -105,7 +105,8 @@ PRESET_HIGH = 0x02
 CMD_PRESET_GET = "05008119edf1"
 CMD_PRESET_HIGH = "06008219edf14102"
 CMD_PRESET_NORMAL = "06008219edf14100"
-PRICK_MIN_INTERVAL_SEC = 12 * 3600  # automatic pricks at most every 12 h
+PRICK_PROOF_HOLD_SEC = 12 * 3600    # a prick that saw current proves the clamps on for 12 h
+PRICK_BACKOFF_SEC = 12 * 3600       # after a prick that saw NO current (or failed): no auto prick for 12 h
 PRICK_EVAL_SEC = 600                # current must show within 10 min of a prick
 PRICK_KEEPALIVE_SEC = 1.0           # the charger drops a link on slower keepalives
 
@@ -195,7 +196,14 @@ class VictronBLEMonitor:
         # The prick: why one is due ("auto"/"manual"), when the last one ran,
         # and until when the following cycles are watched for current.
         self._prick_pending: Optional[str] = None
-        self._last_prick_ts: Optional[float] = None
+        # 2026-10-15: one interval for everything left a gap - a prick's proof was
+        # remembered 4 h (CURRENT_MEMORY_SEC) but the next prick waited 12 h, so the
+        # verdict sat at Off from ~08 to 16 with the clamps on and a false reminder
+        # went out at 11:04. Now a prick that saw current holds the verdict for
+        # PRICK_PROOF_HOLD_SEC, and only a prick that saw nothing (or failed) backs
+        # the automatic prick off; a manual prick never blocks the automatic one.
+        self._prick_proven_ts: Optional[float] = None
+        self._prick_backoff_until: float = 0.0
         self._prick_eval_until: Optional[float] = None
         self._prick_stamp = ""
         self._prick_from = "Unknown"   # charger state when the prick was made
@@ -376,6 +384,10 @@ class VictronBLEMonitor:
         # than flap OFF until the (possibly 45+ min away) next pulse, assume
         # connected for STARTUP_GRACE_SEC. Only reached when the charger is
         # online (offline is handled earlier), so this never masks a mains loss.
+        if self._prick_proven_ts is not None:
+            age = time.monotonic() - self._prick_proven_ts
+            if age <= PRICK_PROOF_HOLD_SEC:
+                return f"Connected (prick {int(age // 60)}m ago)"
         if (time.monotonic() - self._startup_ts) <= STARTUP_GRACE_SEC:
             return "Connected (startup grace)"
         if len(h) >= 3 and all(c["regs"] <= 3 for c in h):
@@ -389,10 +401,12 @@ class VictronBLEMonitor:
         if self._prick_eval_until is not None:
             if has_current:
                 self._prick_eval_until = None
+                self._prick_proven_ts = now
                 await self._prick_result(f"{self._prick_stamp} current seen - clamps on the bike")
             elif now > self._prick_eval_until:
                 self._prick_eval_until = None
                 if self._prick_from == "Storage":
+                    self._prick_backoff_until = now + PRICK_BACKOFF_SEC
                     await self._prick_result(f"{self._prick_stamp} no current after the prick - clamps off")
                 else:
                     await self._prick_result(f"{self._prick_stamp} no current - not conclusive, "
@@ -402,7 +416,7 @@ class VictronBLEMonitor:
             return
         if self._cache.get("state") != "Storage":
             return
-        if self._last_prick_ts is not None and now - self._last_prick_ts < PRICK_MIN_INTERVAL_SEC:
+        if now < self._prick_backoff_until:
             return
         self._prick_pending = self._prick_pending or "auto"
 
@@ -426,7 +440,6 @@ class VictronBLEMonitor:
     async def _prick(self):
         """Preset Normal -> High -> Normal in one short connection, each step read back."""
         why, self._prick_pending = self._prick_pending, None
-        self._last_prick_ts = time.monotonic()   # attempts count too: no retry storm
         self._prick_stamp = time.strftime("%d/%m %H:%M")
         self._prick_from = self._cache.get("state") or "Unknown"
         stamp = self._prick_stamp
@@ -466,6 +479,7 @@ class VictronBLEMonitor:
             await send(CMD_PRESET_GET, 1.0)
             before = preset()
             if before != PRESET_NORMAL:
+                self._prick_backoff_until = time.monotonic() + PRICK_BACKOFF_SEC
                 result = f"{stamp} skipped - preset reads {before}, not Normal; left alone"
                 return
             buf.clear()
@@ -483,14 +497,17 @@ class VictronBLEMonitor:
                 await send(CMD_PRESET_GET, 1.5)
                 after = preset()
             if after != PRESET_NORMAL:
+                self._prick_backoff_until = time.monotonic() + PRICK_BACKOFF_SEC
                 result = f"{stamp} ALERT - preset reads {after} after the prick, not Normal"
                 log.error("Prick: preset not back on Normal (%s)", after)
             elif high != PRESET_HIGH:
+                self._prick_backoff_until = time.monotonic() + PRICK_BACKOFF_SEC
                 result = f"{stamp} High not confirmed (read {high}); preset Normal"
             else:
                 self._prick_eval_until = time.monotonic() + PRICK_EVAL_SEC
                 result = f"{stamp} pricked ({why}, from {self._prick_from}) - watching for current"
         except Exception as e:
+            self._prick_backoff_until = time.monotonic() + PRICK_BACKOFF_SEC
             result = f"{stamp} prick failed: {e}"
             if high_sent and client.is_connected:
                 try:
@@ -807,6 +824,7 @@ class VictronBLEMonitor:
                 # Drop the pulse memory too: once mains is gone the previous
                 # pulse no longer proves anything about the next session.
                 self._last_current_seen_ts = None
+                self._prick_proven_ts = None    # a proof from before a mains loss proves nothing now
 
     # ── Main loop ────────────────────────────────────────────────────────
     async def run(self):
