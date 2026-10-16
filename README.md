@@ -242,9 +242,9 @@ All configuration is at the top of `victron_ble_monitor.py`:
 | `DATA_COLLECT_TIME` | `12` | Seconds to collect data per connection |
 | `OFFLINE_THRESHOLD` | `3` | Consecutive failures before marking offline |
 | `MAX_RETRIES` | `2` | Retries per poll cycle |
-| `CURRENT_MEMORY_SEC` | `14400` | Proof D: hold "Connected" this long after a current pulse (4 h) |
+| `CURRENT_MEMORY_SEC` | `10800` | Proof D: hold "Connected" this long after a current pulse (3 h) |
 | `STARTUP_GRACE_SEC` | `3600` | Proof D: optimistic "Connected" window after a restart (1 h) |
-| `PRICK_PROOF_HOLD_SEC` | `43200` | The prick: a prick that saw current proves the clamps on for 12 h |
+| `PRICK_PROOF_HOLD_SEC` | `10800` | The prick: a prick that saw current proves the clamps on for 3 h |
 | `PRICK_BACKOFF_SEC` | `43200` | The prick: after a prick that saw no current (or failed), no automatic prick for 12 h |
 | `PRICK_EVAL_SEC` | `600` | The prick: current must show within 10 min to prove the clamps on |
 
@@ -302,8 +302,8 @@ OFF, and when a gap exceeded the 30-min reminder grace it fired a **false
 **Fix:** a current pulse is HARD proof of a closed circuit (clamps on), so the
 proof does not need frequent renewal. The daemon remembers the timestamp of the
 last cycle in which current was seen and holds the `Connected` verdict for up to
-`CURRENT_MEMORY_SEC` (default **14400 s = 4 h**), which comfortably bridges any
-realistic Storage pulse gap while staying well inside an overnight window.
+`CURRENT_MEMORY_SEC` (default **10800 s = 3 h**, 4 h until 2026-10-16), which bridges
+most Storage pulse gaps; a longer gap is bridged by the prick (below).
 
 **Why a long window is safe for drain detection:**
 
@@ -351,7 +351,7 @@ clamps off there is no circuit and no current.
 |-----------|-----|
 | Verdict is `Uncertain` or `Off?` | Only when in doubt — a `Connected` verdict needs no prick |
 | Charger state is **Storage** | From Absorption (14.4-14.7 V) a prick cannot raise the voltage, so a full battery takes nothing and "no current" proves nothing. Seen on the first manual test: the clamps were on, the charger was in Absorption, and the result wrongly said "clamps off" |
-| No proof and no backoff running | A prick that saw current holds `Connected (prick Nm ago)` for 12 h, so the next one comes when that runs out - at most two a day, each a short extra Absorption for a full battery (the charger does one a week by itself). A prick that saw **no** current, or failed, backs off 12 h so a charger without a battery is not pricked every cycle |
+| No proof and no backoff running | A prick that saw current holds `Connected (prick Nm ago)` for 3 h, so the next one comes when that runs out - at most eight a day, each a short extra Absorption for a full battery (the charger does one a week by itself). A prick that saw **no** current, or failed, backs off 12 h so a charger without a battery is not pricked every cycle |
 | `MC_Charger_Prick` ON | A manual prick, any state — the result says "not conclusive" unless it was made from Storage |
 
 **Safety:** the prick reads the preset first and leaves the charger alone
@@ -360,7 +360,7 @@ it back, and writes Normal again if the read-back is anything else (reported as
 `ALERT` in the result). Recondition and Li-ion are never written. One short BLE
 connection (the charger drops links after ~12 s; keepalive every 1 s).
 
-**Why the proof is held 12 h (2026-10-15):** the first version remembered a
+**Why the hold and the prick interval are one number (2026-10-15):** the first version remembered a
 prick's current only for the 4 h pulse memory but waited 12 h before the next
 prick, so the verdict fell to Off at about 08:00 after a 04:00 prick, with the
 clamps on, and a false reminder went out at 11:04. The trade-off of the hold: a
@@ -368,12 +368,18 @@ clamp taken off soon after a successful prick, without the bike leaving home, is
 only noticed when the hold runs out (riding away is noticed at once - the bike is
 no longer home).
 
+**3 h since 2026-10-16** (it was 12 h): with 12 h a clamp taken off just after a
+successful prick took up to 12.5 h to report. Now the pulse memory and the proof
+hold are both 3 h, so the worst case is about 3.5 h: 3 h hold, the prick and its
+10 min, then the reminder's 30 min grace. The price is up to eight short
+Absorptions a day instead of two on a full battery.
+
 **Results** in `MC_Charger_Prick_Result`:
 
 | Result | Meaning |
 |--------|---------|
 | `… pricked (auto, from Storage) - watching for current` | Done, waiting up to `PRICK_EVAL_SEC` |
-| `… current seen - clamps on the bike` | Proof D turns `Connected (current seen)`, then holds `Connected (prick Nm ago)` for 12 h — reminder cancelled |
+| `… current seen - clamps on the bike` | Proof D turns `Connected (current seen)`, then holds `Connected (prick Nm ago)` for 3 h — reminder cancelled |
 | `… no current after the prick - clamps off` | From Storage: the clamps are off, the reminder is right |
 | `… no current - not conclusive, charger was in X` | A manual prick from another state |
 | `… skipped - preset reads N, not Normal; left alone` | Someone set another preset; the daemon does not touch it |
@@ -441,7 +447,7 @@ sitemaps/myhouse.sitemap            # Victron Charger frame
 - Should resolve after 1-2 poll cycles
 
 **The prick never runs**
-- It needs the verdict `Uncertain`/`Off?` AND the charger in Storage AND no 12 h proof hold or backoff running
+- It needs the verdict `Uncertain`/`Off?` AND the charger in Storage AND no 3 h proof hold or 12 h backoff running
 - Right after a restart the verdict is `Connected (startup grace)` for 1 h — no prick
 - Press "Probe charger now" (`MC_Charger_Prick`) to prick by hand; watch `journalctl -u victron-ble-monitor | grep Prick`
 

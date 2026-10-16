@@ -71,7 +71,8 @@ OFFLINE_THRESHOLD = 3       # consecutive failures before marking offline
 #     which is fine for battery health and still well inside an overnight window.
 # The window only relaxes the already-proven-connected case, never the
 # dangerous never-connected case.
-CURRENT_MEMORY_SEC = 14400  # 4 h: hold "Connected" across deep-Storage pulse gaps
+CURRENT_MEMORY_SEC = 3 * 3600  # 3 h: hold "Connected" across deep-Storage pulse gaps (4 h until
+                               # 2026-10-16; 3 h with the prick every 3 h: clamps off is told within ~3.5 h)
 # Startup grace: after a daemon/Pi restart the pulse memory is empty, so a
 # restart that lands mid-gap (Storage pulses can be 45+ min apart) would flip
 # MC_Secondary_Connected OFF until the next pulse and risk a false reminder.
@@ -105,7 +106,8 @@ PRESET_HIGH = 0x02
 CMD_PRESET_GET = "05008119edf1"
 CMD_PRESET_HIGH = "06008219edf14102"
 CMD_PRESET_NORMAL = "06008219edf14100"
-PRICK_PROOF_HOLD_SEC = 12 * 3600    # a prick that saw current proves the clamps on for 12 h
+PRICK_PROOF_HOLD_SEC = 3 * 3600     # a prick that saw current proves the clamps on for 3 h, so one is
+                                    # due every 3 h (owner, 2026-10-16; 12 h before: up to 12.5 h to notice)
 PRICK_BACKOFF_SEC = 12 * 3600       # after a prick that saw NO current (or failed): no auto prick for 12 h
 PRICK_EVAL_SEC = 600                # current must show within 10 min of a prick
 PRICK_KEEPALIVE_SEC = 1.0           # the charger drops a link on slower keepalives
