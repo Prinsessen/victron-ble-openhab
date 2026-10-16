@@ -245,7 +245,8 @@ All configuration is at the top of `victron_ble_monitor.py`:
 | `CURRENT_MEMORY_SEC` | `10800` | Proof D: hold "Connected" this long after a current pulse (3 h) |
 | `STARTUP_GRACE_SEC` | `3600` | Proof D: optimistic "Connected" window after a restart (1 h) |
 | `PRICK_PROOF_HOLD_SEC` | `10800` | The prick: a prick that saw current proves the clamps on for 3 h |
-| `PRICK_BACKOFF_SEC` | `43200` | The prick: after a prick that saw no current (or failed), no automatic prick for 12 h |
+| `PRICK_BACKOFF_SEC` | `43200` | The prick: after a prick that failed (BLE error, preset not Normal), no automatic prick for 12 h |
+| `PRICK_OFF_RECHECK_SEC` | `10800` | The prick: after a prick from Storage that saw no current (clamps off), the next one in 3 h - clamps put back on a full battery are found again |
 | `PRICK_EVAL_SEC` | `600` | The prick: current must show within 10 min to prove the clamps on |
 
 ### Charge Profile Setpoints
@@ -380,7 +381,7 @@ Absorptions a day instead of two on a full battery.
 |--------|---------|
 | `… pricked (auto, from Storage) - watching for current` | Done, waiting up to `PRICK_EVAL_SEC` |
 | `… current seen - clamps on the bike` | Proof D turns `Connected (current seen)`, then holds `Connected (prick Nm ago)` for 3 h — reminder cancelled |
-| `… no current after the prick - clamps off` | From Storage: the clamps are off, the reminder is right |
+| `… no current after the prick - clamps off` | From Storage: the clamps are off. The older proofs (pulse memory, prick hold, startup grace) are dropped at once, so Proof D falls to `Uncertain`/`Off?` on the next cycle and the reminder follows 30 min later (before 2026-10-16 an older pulse kept `Connected` for up to 3 h more) |
 | `… no current - not conclusive, charger was in X` | A manual prick from another state |
 | `… skipped - preset reads N, not Normal; left alone` | Someone set another preset; the daemon does not touch it |
 | `… ALERT - preset reads N after the prick, not Normal` | Check the charger in VictronConnect |

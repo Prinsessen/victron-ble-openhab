@@ -108,7 +108,9 @@ CMD_PRESET_HIGH = "06008219edf14102"
 CMD_PRESET_NORMAL = "06008219edf14100"
 PRICK_PROOF_HOLD_SEC = 3 * 3600     # a prick that saw current proves the clamps on for 3 h, so one is
                                     # due every 3 h (owner, 2026-10-16; 12 h before: up to 12.5 h to notice)
-PRICK_BACKOFF_SEC = 12 * 3600       # after a prick that saw NO current (or failed): no auto prick for 12 h
+PRICK_BACKOFF_SEC = 12 * 3600       # after a prick that failed (BLE, preset not Normal): no auto prick for 12 h
+PRICK_OFF_RECHECK_SEC = 3 * 3600    # after a prick from Storage that saw NO current (clamps off): the next
+                                    # one in 3 h, so clamps put back on a full battery are found again
 PRICK_EVAL_SEC = 600                # current must show within 10 min of a prick
 PRICK_KEEPALIVE_SEC = 1.0           # the charger drops a link on slower keepalives
 
@@ -408,7 +410,13 @@ class VictronBLEMonitor:
             elif now > self._prick_eval_until:
                 self._prick_eval_until = None
                 if self._prick_from == "Storage":
-                    self._prick_backoff_until = now + PRICK_BACKOFF_SEC
+                    self._prick_backoff_until = now + PRICK_OFF_RECHECK_SEC
+                    # As hard a proof as current after a prick, the other way: forget the older
+                    # proofs now, or a pulse or prick from before the clamps came off holds
+                    # "Connected" for up to 3 h more (seen 2026-10-16 12:31, test with the owner).
+                    self._last_current_seen_ts = None
+                    self._prick_proven_ts = None
+                    self._startup_ts = now - STARTUP_GRACE_SEC - 1
                     await self._prick_result(f"{self._prick_stamp} no current after the prick - clamps off")
                 else:
                     await self._prick_result(f"{self._prick_stamp} no current - not conclusive, "
